@@ -180,7 +180,7 @@ def main(
     mnist = fdatasets(root="./data", train=True, download=True, transform=transform)
     dataloader = DataLoader(mnist, batch_size=192, shuffle=True, drop_last=True)
 
-    wandb.init(project=f"{dataset_name}")
+    wandb.init(project=f"rf_{dataset_name}")
 
     for epoch in range(15):
         lossbin = {i: 0 for i in range(10)}
