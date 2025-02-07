@@ -82,15 +82,15 @@ class RF:
         texp = t.view([b, *([1] * len(x.shape[1:]))])
         z1 = torch.randn_like(x)
         zt = (1 - texp) * x + texp * z1
-        vtheta = self.model(zt, t, cond)
-        lc_loss = self.MSE(z1 - x - vtheta)
+        vtheta, aux_loss = self.model(zt, t, cond) # Get aux_loss from model
+        mse_loss = self.MSE(z1 - x - vtheta)
 
         # logsnr bias
         logsnr = 2 * torch.log((1 - t) / t)
         logsnr = logsnr.clamp(-20, 20)
         weights = self.sigmoidal_weighting(logsnr)
 
-        batchwise_loss = weights * lc_loss.mean(dim=list(range(1, len(x.shape))))
+        batchwise_loss = weights * mse_loss.mean(dim=list(range(1, len(x.shape))))
 
         batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
         tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
@@ -101,9 +101,9 @@ class RF:
         v_predict = vtheta
         perceptual_loss = self.perceptual_loss(v_predict, v_target)
 
-        total_loss = batchwise_loss.mean()
+        total_loss = batchwise_loss.mean() + 0.01 * aux_loss
 
-        return total_loss, ttloss, batchwise_mse.mean(), perceptual_loss
+        return total_loss, ttloss, batchwise_mse.mean(), perceptual_loss, aux_loss # Return aux_loss
 
     @torch.no_grad()
     def sample(self, z, cond, null_cond=None, sample_steps=50, cfg=2.0):
@@ -115,9 +115,9 @@ class RF:
             t = i / sample_steps
             t = torch.tensor([t] * b).to(z.device)
 
-            vc = self.model(z, t, cond)
+            vc, _ = self.model(z, t, cond)
             if null_cond is not None:
-                vu = self.model(z, t, null_cond)
+                vu, _ = self.model(z, t, null_cond)
                 vc = vu + cfg * (vc - vu)
 
             z = z - dt * vc
@@ -150,7 +150,7 @@ def main(
         )
         channels = 3
         model = DiUT_Llama(
-            channels, 32, dim=64, n_steps=1, n_layers=6, n_heads=4, num_classes=10, num_moe_experts=1
+            channels, 32, dim=64, n_steps=1, n_layers=4, n_heads=4, num_classes=10, num_moe_experts=1
         ).cuda()
 
     else:
@@ -165,7 +165,7 @@ def main(
         )
         channels = 1
         model = DiUT_Llama(
-            channels, 32, dim=64, n_steps=1, n_layers=4, n_heads=4, num_classes=10, num_moe_experts=1
+            channels, 32, dim=64, n_steps=1, n_layers=4, n_heads=1, num_classes=10, num_moe_experts=1
         ).cuda()
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -174,28 +174,28 @@ def main(
     rf = RF(model)
     # Create the optimizer
     optimizer = SOAP(model.parameters(), lr=1e-2, betas=(.95, .95), weight_decay=.001, precondition_frequency=4)
-    steps = (60000 // 192) * 15
-    scheduler = get_wsd_schedule(optimizer, steps * 0.01, steps * 0.64, steps * 0.35)
+    steps = (60000 // 192) * 5
+    scheduler = get_wsd_schedule(optimizer, steps * 0.05, steps * 0.6, steps * 0.35)
 
     mnist = fdatasets(root="./data", train=True, download=True, transform=transform)
     dataloader = DataLoader(mnist, batch_size=192, shuffle=True, drop_last=True)
 
-    wandb.init(project=f"rf_{dataset_name}")
+    wandb.init(project=f"rf_{dataset_name}_arch")
 
-    for epoch in range(15):
+    for epoch in range(5):
         lossbin = {i: 0 for i in range(10)}
         losscnt = {i: 1e-6 for i in range(10)}
         pbar = tqdm(enumerate(dataloader), total=len(dataloader))
         for i, (x, c) in pbar:
             x, c = x.cuda(), c.cuda()
             optimizer.zero_grad()
-            loss, blsct, mse_loss, perceptual_loss = rf.forward(x, c) # Get perceptual loss
+            loss, blsct, mse_loss, perceptual_loss, aux_loss = rf.forward(x, c) # Get aux_loss
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-            wandb.log({"loss": loss.item(), "mse_loss": mse_loss.item(), "perceptual_loss": perceptual_loss.item()}) # Log perceptual loss
-            pbar.set_description(f"Epoch {epoch+1}, Loss: {loss.item():.4f}, MSE: {mse_loss.item():.4f}, Perceptual: {perceptual_loss.item():.4f}")
+            wandb.log({"loss": loss.item(), "mse_loss": mse_loss.item(), "perceptual_loss": perceptual_loss.item(), "aux_loss": aux_loss.item()}) # Log aux_loss
+            pbar.set_description(f"Epoch {epoch+1}, Loss: {loss.item():.4f}, MSE: {mse_loss.item():.4f}, Perceptual: {perceptual_loss.item():.4f}, Aux: {aux_loss.item():.4f}") # Include Aux in description
 
 
             # count based on t

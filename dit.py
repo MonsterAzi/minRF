@@ -87,37 +87,16 @@ class FeedForward(nn.Module):
         return self.w2(self._forward_sin_gating(self.w1(x), self.w3(x)))
     
 class Attention(nn.Module):
-    def __init__(self, dim, n_heads):
+    def __init__(self, dim):
         super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = dim // n_heads
-        self.wq = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(n_heads * self.head_dim, dim, bias=False)
-        self.q_norm = nn.LayerNorm(self.n_heads * self.head_dim)
-        self.k_norm = nn.LayerNorm(self.n_heads * self.head_dim)
+        self.wq = nn.Linear(dim, dim, bias=False)
+        self.wk = nn.Linear(dim, dim, bias=False)
+        self.wv = nn.Linear(dim, dim, bias=False)
+        self.wo = nn.Linear(dim, dim, bias=False)
+        self.q_norm = nn.LayerNorm(dim)
+        self.k_norm = nn.LayerNorm(dim)
 
-    @staticmethod
-    def reshape_for_broadcast(freqs_cis, x):
-        ndim = x.ndim
-        assert 0 <= 1 < ndim
-        _freqs_cis = freqs_cis[: x.shape[1]]
-        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-        return _freqs_cis.view(*shape)
-
-    @staticmethod
-    def apply_rotary_emb(xq, xk, freqs_cis):
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis_xq = Attention.reshape_for_broadcast(freqs_cis, xq_)
-        freqs_cis_xk = Attention.reshape_for_broadcast(freqs_cis, xk_)
-
-        xq_out = torch.view_as_real(xq_ * freqs_cis_xq).flatten(3)
-        xk_out = torch.view_as_real(xk_ * freqs_cis_xk).flatten(3)
-        return xq_out, xk_out
-
-    def forward(self, x, freqs_cis):
+    def forward(self, x):
         bsz, seqlen, _ = x.shape
         dtype = x.dtype
 
@@ -126,231 +105,87 @@ class Attention(nn.Module):
         xq = self.q_norm(xq)
         xk = self.k_norm(xk)
 
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xq = xq.permute(0, 2, 1)
+        xk = xk.permute(0, 2, 1)
+        xv = xv.permute(0, 2, 1)
 
-        xq, xk = self.apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        xq, xk = xq.to(dtype), xk.to(dtype)
-
-        xq = xq.permute(0, 2, 1, 3)
-        xk = xk.permute(0, 2, 1, 3)
-        xv = xv.permute(0, 2, 1, 3)
-
-        scale_factor = 1 / math.sqrt(xq.size(-1))
-        attn_weight = xq @ xk.transpose(-2, -1) * scale_factor
+        attn_weight = xq @ xk.transpose(-2, -1)
         attn_weight = torch.softmax(attn_weight, dim=-1)
         output = attn_weight @ xv
-        output = output.permute(0, 2, 1, 3).flatten(-2)
+        output = output.permute(0, 2, 1).flatten(-1)
 
         return self.wo(output)
-
-class LongTermMemory(nn.Module):
-    def __init__(self, dim, n_heads, memory_layers=2):
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = dim // n_heads
-        self.wq = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(dim, dim, bias=False) # Output dim should be dim, not n_heads * head_dim in this case
-        self.q_norm = nn.LayerNorm(self.n_heads * self.head_dim)
-        self.k_norm = nn.LayerNorm(self.n_heads * self.head_dim)
-
-        # Memory Module (MLP)
-        memory_layers_list = []
-        for _ in range(memory_layers - 1):
-            memory_layers_list.append(nn.Linear(self.head_dim, self.head_dim))
-            memory_layers_list.append(nn.ReLU()) # Or other activation
-        memory_layers_list.append(nn.Linear(self.head_dim, self.head_dim))
-        self.memory_mlp = nn.Sequential(*memory_layers_list)
-
-        # Learnable parameters for memory control (alpha, eta, theta) - using simple Linear for now
-        self.alpha_proj = nn.Linear(dim, self.n_heads * 1) # Output 1 per head, then average or similar
-        self.eta_proj = nn.Linear(dim, self.n_heads * 1)
-        self.theta_proj = nn.Linear(dim, self.n_heads * 1)
-        self.sigmoid = nn.Sigmoid() # To keep alpha, eta, theta in [0, 1] or similar range
-        self.relu = nn.ReLU() # For theta, ensure non-negative
-
-        # Initialize memory and surprise - head-specific
-        self.register_buffer('memory', torch.zeros(1, n_heads, self.head_dim)) # (1, n_heads, head_dim) - initialized per head
-        self.register_buffer('surprise', torch.zeros(1, n_heads, self.head_dim)) # (1, n_heads, head_dim) - initialized per head
-
-
-    @staticmethod
-    def reshape_for_broadcast(freqs_cis, x):
-        ndim = x.ndim
-        assert 0 <= 1 < ndim
-        _freqs_cis = freqs_cis[: x.shape[1]]
-        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-        return _freqs_cis.view(*shape)
-
-    @staticmethod
-    def apply_rotary_emb(xq, xk, freqs_cis):
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis_xq = LongTermMemory.reshape_for_broadcast(freqs_cis, xq_)
-        freqs_cis_xk = LongTermMemory.reshape_for_broadcast(freqs_cis, xk_)
-
-        xq_out = torch.view_as_real(xq_ * freqs_cis_xq).flatten(3)
-        xk_out = torch.view_as_real(xk_ * freqs_cis_xk).flatten(3)
-        return xq_out, xk_out
-
-    def forward(self, x, freqs_cis):
-        bsz, seqlen, _ = x.shape
-        dtype = x.dtype
-
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-
-        xq = self.q_norm(xq)
-        xk = self.k_norm(xk)
-
-        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, seqlen, self.n_heads, self.head_dim)
-        xv = xv.view(bsz, seqlen, self.n_heads, self.head_dim)
-
-        xq, xk = self.apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-        xq, xk = xq.to(dtype), xk.to(dtype)
-
-        output_tokens = []
-        # Expand memory and surprise to batch size at the beginning of the sequence
-        current_memory = self.memory.expand(bsz, -1, -1) # (bsz, n_heads, head_dim)
-        current_surprise = self.surprise.expand(bsz, -1, -1) # (bsz, n_heads, head_dim)
-
-
-        for t in range(seqlen):
-            xt = x[ :, t, :] # (bsz, dim)
-            qt = xq[:, t, :, :] # (bsz, n_heads, head_dim)
-            kt = xk[:, t, :, :] # (bsz, n_heads, head_dim)
-            vt = xv[:, t, :, :] # (bsz, n_heads, head_dim)
-
-            # Memory control parameters - data-dependent
-            alpha_t_raw = self.alpha_proj(xt).view(bsz, self.n_heads, 1) # (bsz, n_heads, 1)
-            eta_t_raw = self.eta_proj(xt).view(bsz, self.n_heads, 1)
-            theta_t_raw = self.theta_proj(xt).view(bsz, self.n_heads, 1)
-
-            alpha_t = self.sigmoid(alpha_t_raw) # Ensure between 0 and 1
-            eta_t = self.sigmoid(eta_t_raw) # Ensure between 0 and 1
-            theta_t = self.relu(theta_t_raw) # Ensure non-negative
-
-            # Loss and Surprise - using direct difference as surprise signal
-            memory_readout = self.memory_mlp(kt) # M_{t-1}(k_t) - (bsz, n_heads, head_dim)
-            surprise_signal = memory_readout - vt # (bsz, n_heads, head_dim) -  M_{t-1}(k_t) - v_t
-
-            # Memory Update - Equations (13) and (14)
-            current_surprise = eta_t * current_surprise - theta_t * surprise_signal # S_t = eta_t * S_{t-1} - theta_t * (M_{t-1}(k_t) - v_t)
-            current_memory = (1 - alpha_t) * current_memory + current_surprise # M_t = (1 - alpha_t) * M_{t-1} + S_t
-
-            # Memory Retrieval - Equation (15) - M*(q_t)
-            yt = self.memory_mlp(qt) # M*(q_t) - (bsz, n_heads, head_dim)
-            output_tokens.append(yt)
-
-
-        output = torch.stack(output_tokens, dim=1) # (bsz, seqlen, n_heads, head_dim)
-        output = output.flatten(2, 3) # Flatten n_heads and head_dim to get (bsz, seqlen, dim)
-
-        # Update persistent memory (for next forward pass in sequence)
-        # Take the last batch's memory state and store it as the persistent memory
-        self.memory.copy_(current_memory[:1].detach()) # Detach and take only the first batch item to update persistent memory
-        self.surprise.copy_(current_surprise[:1].detach()) # Detach and take only the first batch item for surprise
-
-
-        return self.wo(output)
-
-class MoEAttention(nn.Module):
-    def __init__(self, dim, n_heads, num_experts=4):
-        super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = dim // n_heads
-        self.num_experts = num_experts
-
-        self.wq = nn.ModuleList([nn.Linear(dim, n_heads * self.head_dim, bias=False) for _ in range(num_experts)])
-        self.wk = nn.ModuleList([nn.Linear(dim, n_heads * self.head_dim, bias=False) for _ in range(num_experts)])
-        self.wv = nn.ModuleList([nn.Linear(dim, n_heads * self.head_dim, bias=False) for _ in range(num_experts)])
-        self.wo = nn.ModuleList([nn.Linear(n_heads * self.head_dim, dim, bias=False) for _ in range(num_experts)])
-
-        self.q_norm = nn.ModuleList([nn.LayerNorm(self.n_heads * self.head_dim) for _ in range(num_experts)])
-        self.k_norm = nn.ModuleList([nn.LayerNorm(self.n_heads * self.head_dim) for _ in range(num_experts)])
-
-        self.gate = nn.Linear(dim, num_experts)
-
-    @staticmethod
-    def reshape_for_broadcast(freqs_cis, x):
-        ndim = x.ndim
-        assert 0 <= 1 < ndim
-        _freqs_cis = freqs_cis[: x.shape[1]]
-        shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-        return _freqs_cis.view(*shape)
-
-    @staticmethod
-    def apply_rotary_emb(xq, xk, freqs_cis):
-        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        freqs_cis_xq = MoEAttention.reshape_for_broadcast(freqs_cis, xq_)
-        freqs_cis_xk = MoEAttention.reshape_for_broadcast(freqs_cis, xk_)
-
-        xq_out = torch.view_as_real(xq_ * freqs_cis_xq).flatten(3)
-        xk_out = torch.view_as_real(xk_ * freqs_cis_xk).flatten(3)
-        return xq_out, xk_out
-
-    def forward(self, x, freqs_cis):
-        bsz, seqlen, _ = x.shape
-        dtype = x.dtype
-
-        # Gating
-        gate_logits = self.gate(x)
-        gate_weights = torch.sigmoid(gate_logits)
-
-        expert_outputs = []
-        for i in range(self.num_experts):
-            xq_e, xk_e, xv_e = self.wq[i](x), self.wk[i](x), self.wv[i](x)
-
-            xq_e = self.q_norm[i](xq_e)
-            xk_e = self.k_norm[i](xk_e)
-
-            xq_e = xq_e.view(bsz, seqlen, self.n_heads, self.head_dim)
-            xk_e = xk_e.view(bsz, seqlen, self.n_heads, self.head_dim)
-            xv_e = xv_e.view(bsz, seqlen, self.n_heads, self.head_dim)
-
-            xq_e, xk_e = self.apply_rotary_emb(xq_e, xk_e, freqs_cis=freqs_cis)
-            xq_e, xk_e = xq_e.to(dtype), xk_e.to(dtype)
-
-            xq_e = xq_e.permute(0, 2, 1, 3)
-            xk_e = xk_e.permute(0, 2, 1, 3)
-            xv_e = xv_e.permute(0, 2, 1, 3)
-
-            scale_factor = 1 / math.sqrt(xq_e.size(-1))
-            attn_weight_e = xq_e @ xk_e.transpose(-2, -1) * scale_factor
-            attn_weight_e = torch.softmax(attn_weight_e, dim=-1)
-            output_e = attn_weight_e @ xv_e
-            output_e = output_e.permute(0, 2, 1, 3).flatten(-2)
-            expert_outputs.append(self.wo[i](output_e))
-
-        # Combine expert outputs
-        expert_outputs = torch.stack(expert_outputs, dim=0)  # (num_experts, bsz, seqlen, dim)
-        output = torch.einsum("ebsd,bse->bsd", expert_outputs, gate_weights)
-        return output
 
 class MoEFeedForward(nn.Module):
-    def __init__(self, dim, hidden_dim, multiple_of, num_experts=4, ffn_dim_multiplier=None):
+    def __init__(self, dim, hidden_dim, multiple_of, num_experts, ffn_dim_multiplier=None):
         super().__init__()
         self.num_experts = num_experts
         self.experts = nn.ModuleList([
-            FeedForward(dim, hidden_dim, multiple_of, ffn_dim_multiplier) for _ in range(num_experts)
+            FeedForward(dim, hidden_dim, multiple_of, ffn_dim_multiplier)
+            for _ in range(num_experts)
         ])
-        self.gate = nn.Linear(dim, num_experts)
+        self.router = nn.Linear(dim, num_experts)
 
     def forward(self, x):
-        # Gating
-        gate_logits = self.gate(x)
-        gate_weights = torch.sigmoid(gate_logits)
+        B, SeqLen, Dim = x.shape
+        num_experts = self.num_experts
+        top_k = min(2, num_experts)
 
-        # Expert outputs
-        expert_outputs = torch.stack([expert(x) for expert in self.experts], dim=0)  # (num_experts, bsz, seqlen, dim)
+        # 1. Routing probabilities and top-k expert selection
+        router_logits = F.normalize(self.router(x))
+        router_logits_mean = router_logits.mean(dim=-1, keepdim=True)
+        router_logits_std = router_logits.std(dim=-1, keepdim=True)
+        router_logits_normalized = (router_logits - router_logits_mean) / (router_logits_std + 1e-6) # Add small epsilon for numerical stability
+        router_probs = F.softmax(router_logits, dim=-1)
+        expert_weights, expert_indices = torch.topk(router_probs, k=top_k, dim=-1, sorted=False)
 
-        # Combine expert outputs
-        output = torch.einsum("ebsd,bse->bsd", expert_outputs, gate_weights)
-        return output
+        # Flatten input for efficient indexing
+        x_flat = x.reshape(-1, Dim)  # (B * SeqLen, Dim)
+        expert_indices_flat = expert_indices.reshape(-1, top_k)  # (B * SeqLen, top_k)
+        expert_weights_flat = expert_weights.reshape(-1, top_k)  # (B * SeqLen, top_k)
+
+        # Initialize output tensor
+        moe_output_flat = torch.zeros_like(x_flat)
+
+        # Vectorized Grouping and Expert Processing (Iterate through unique experts)
+        batch_seq_indices = torch.arange(B * SeqLen, device=x.device)
+        expanded_batch_seq_indices = batch_seq_indices.unsqueeze(-1).repeat(1, top_k)
+
+        global_token_indices = expanded_batch_seq_indices.flatten()
+        expert_indices_for_tokens = expert_indices_flat.flatten()
+        expert_weights_for_tokens = expert_weights_flat.flatten()
+
+        # Find unique expert indices that are actually used
+        unique_expert_indices = torch.unique(expert_indices_for_tokens)
+
+        # Process each expert using vectorized operations and scatter directly
+        for expert_idx in unique_expert_indices: # Iterate through unique experts
+            expert_idx = expert_idx.item() # Convert to int for comparison
+            expert_mask = (expert_indices_for_tokens == expert_idx)
+            if expert_mask.any():
+                current_expert_token_indices = global_token_indices[expert_mask]
+                current_expert_weights = expert_weights_for_tokens[expert_mask]
+                current_expert_input = x_flat[current_expert_token_indices]
+
+                # Expert forward pass
+                current_expert_output = self.experts[expert_idx](current_expert_input)
+
+                # Weighted output (no normalization now)
+                weighted_expert_output = current_expert_output * current_expert_weights.unsqueeze(-1)
+
+                # Scatter the weighted output (no normalization)
+                moe_output_flat.index_add_(0, current_expert_token_indices, weighted_expert_output)
+
+
+        # Reshape back to original shape
+        moe_output = moe_output_flat.reshape(B, SeqLen, Dim)
+
+        # 5. Auxiliary Loss (remains the same)
+        average_router_probs_per_expert = router_probs.mean(dim=0) # Average prob for each expert over tokens
+        target_prob = 1.0 / num_experts # Ideal proportion (assuming simplification to 1/n)
+        aux_loss = torch.sum((target_prob - average_router_probs_per_expert)**2)
+
+        return moe_output, aux_loss
 
 class UTransformerBlock(nn.Module):
     def __init__(
@@ -372,7 +207,7 @@ class UTransformerBlock(nn.Module):
         self.num_moe_experts = num_moe_experts
 
         if num_moe_experts > 1:
-            self.attention = MoEAttention(dim, n_heads, num_experts=num_moe_experts)
+            self.attention = Attention(dim)
             self.feed_forward = MoEFeedForward(
                 dim=dim,
                 hidden_dim=4 * dim,
@@ -381,7 +216,7 @@ class UTransformerBlock(nn.Module):
                 ffn_dim_multiplier=ffn_dim_multiplier,
             )
         else:
-            self.attention = Attention(dim, n_heads)
+            self.attention = Attention(dim)
             self.feed_forward = FeedForward(
                 dim=dim,
                 hidden_dim=4 * dim,
@@ -395,22 +230,34 @@ class UTransformerBlock(nn.Module):
         )
 
     def forward(self, x, freqs_cis, adaln_input=None):
+        aux_loss = torch.tensor([0.0], device=x.device) # Initialize aux_loss
         if adaln_input is not None:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
                 self.adaLN_modulation(adaln_input).chunk(6, dim=1)
             )
 
             x = x + gate_msa.unsqueeze(1) * self.attention(
-                modulate(self.attention_norm(x), shift_msa, scale_msa), freqs_cis
+                modulate(self.attention_norm(x), shift_msa, scale_msa)
             )
-            x = x + gate_mlp.unsqueeze(1) * self.feed_forward(
-                modulate(self.ffn_norm(x), shift_mlp, scale_mlp)
-            )
-        else:
-            x = x + self.attention(self.attention_norm(x), freqs_cis)
-            x = x + self.feed_forward(self.ffn_norm(x))
+            if self.num_moe_experts > 1:
+                x, block_aux_loss = self.feed_forward(
+                    modulate(self.ffn_norm(x), shift_mlp, scale_mlp)
+                )
+                aux_loss = block_aux_loss # Accumulate aux_loss from MoE block
+            else:
+                x = x + gate_mlp.unsqueeze(1) * self.feed_forward(
+                    modulate(self.ffn_norm(x), shift_mlp, scale_mlp)
+                )
 
-        return x
+        else:
+            x = x + self.attention(self.attention_norm(x))
+            if self.num_moe_experts > 1:
+                 x, block_aux_loss = self.feed_forward(self.ffn_norm(x))
+                 aux_loss = block_aux_loss # Accumulate aux_loss from MoE block
+            else:
+                x = x + self.feed_forward(self.ffn_norm(x))
+
+        return x, aux_loss # Return aux_loss from block
 
 class FinalLayer(nn.Module):
     def __init__(self, hidden_size, patch_size, out_channels):
@@ -527,20 +374,22 @@ class DiUT_Llama(nn.Module):
         y = self.y_embedder(y, self.training)  # (N, D)
         adaln_input = t.to(x.dtype) + y.to(x.dtype)
 
+        total_aux_loss = torch.tensor([0.0], device=x.device) # Initialize total aux loss
         for step in range(self.n_steps):
             for layer in self.layers:
-                x = layer(x, self.freqs_cis[: x.size(1)], adaln_input=adaln_input)
+                x, layer_aux_loss = layer(x, self.freqs_cis[: x.size(1)], adaln_input=adaln_input)
+                total_aux_loss += layer_aux_loss # Accumulate aux loss from each layer
 
         x = self.final_layer(x, adaln_input)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
 
-        return x
+        return x, total_aux_loss # Return total aux loss
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, t, y)
-        eps, rest = model_out[:, : self.in_channels], model_out[:, self.in_channels :]
+        eps, rest = model_out[0][:, : self.in_channels], model_out[0][:, self.in_channels :]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
@@ -569,8 +418,8 @@ if __name__ == "__main__":
     y = torch.randint(0, 10, (2,))
 
     with torch.no_grad():
-        out_moe = model_moe(x, t, y)
-        print(f"MoE Output shape: {out_moe.shape}")
+        out_moe, aux_loss_moe = model_moe(x, t, y)
+        print(f"MoE Output shape: {out_moe.shape}, Aux Loss: {aux_loss_moe.item():.4f}")
         out_moe_cfg = model_moe.forward_with_cfg(x, t, y, 0.5)
         print(f"MoE CFG Output shape: {out_moe_cfg.shape}")
 
@@ -579,7 +428,27 @@ if __name__ == "__main__":
     model_no_moe.eval()
 
     with torch.no_grad():
-        out_no_moe = model_no_moe(x, t, y)
-        print(f"No MoE Output shape: {out_no_moe.shape}")
+        out_no_moe, aux_loss_no_moe = model_no_moe(x, t, y)
+        print(f"No MoE Output shape: {out_no_moe.shape}, Aux Loss: {aux_loss_no_moe.item():.4f}")
         out_no_moe_cfg = model_no_moe.forward_with_cfg(x, t, y, 0.5)
         print(f"No MoE CFG Output shape: {out_no_moe_cfg.shape}")
+        
+    import time
+        
+    # Benchmark MoE model
+    start_time = time.time()
+    torch.cuda.synchronize() # Wait for CUDA operations to complete
+    for _ in range(25): # Run forward pass multiple times for better averaging
+        out_moe, aux_loss_moe = model_moe(x, t, y)
+    torch.cuda.synchronize()
+    moe_forward_time = (time.time() - start_time) / 25
+    print(f"MoE Forward Pass Time (averaged over 25 runs): {moe_forward_time:.4f} seconds")
+
+    # Benchmark No-MoE model
+    start_time = time.time()
+    torch.cuda.synchronize()
+    for _ in range(25): # Run forward pass multiple times for better averaging
+        out_no_moe, aux_loss_no_moe = model_no_moe(x, t, y)
+    torch.cuda.synchronize()
+    no_moe_forward_time = (time.time() - start_time) / 25
+    print(f"No MoE Forward Pass Time (averaged over 25 runs): {no_moe_forward_time:.4f} seconds")
